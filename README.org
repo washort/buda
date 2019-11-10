@@ -1,0 +1,7 @@
+* Buda, a workspace manager for Monte
+Buda is intended to handle adding, removing, updating, and building dependencies
+in a Monte developer's workspace, as well as working as a build system inspired
+by DJB's redo.
+** FAQ
+*** What does the name Buda mean?
+Bernstein's Unified Dependency Adfsdsdfgjk
