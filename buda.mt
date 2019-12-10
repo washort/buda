@@ -76,18 +76,36 @@ def makeBuda(findRule, => makeProcess, => stdio) as DeepFrozen:
                 traceln.exception(ee)
                 1
 
+        to fulfillDependencies(rule, prefix):
+            def deps :List[Bytes] := rule.getDependencies()
+            def queue := deps.diverge()
+            # process deps serially for now, in theory we could do this in parallel
+            def fulfillDep():
+                def dep := queue.pop()
+                def p := if (dep[0] == b`*`[0]) {
+                    buda(prefix + dep.slice(1))
+                } else {
+                    buda(dep)
+                }
+                return when (p) ->
+                    if (queue.size > 0):
+                        fulfillDep()
+
         to run(target):
             escape e:
                 def [rule, prefix] := findRule(target, "FAIL" => e)
                 traceln(`target $target rule $rule prefix $prefix`)
-                return when (rule(buda, prefix, target + b`.buda.tmp`)) ->
-                    buda.do(b`mv`, [b`mv`, target + b`.buda.tmp`, target])
+                return when (buda.fulfillDependencies(rule, prefix)) ->
+                    when (rule(buda, prefix, target + b`.buda.tmp`)) ->
+                        traceln(`finished $target`)
+                        buda.do(b`mv`, [b`mv`, target + b`.buda.tmp`, target])
             catch p:
                 # couldn't find a rule to rebuild a target, but maybe it exists?
                 return when (buda.do(b`test`, [b`test`, b`-e`, target])) ->
                     null
                 catch _:
                     p
+
         to do(path :Bytes, argv :List[Bytes]):
             "Run a subprocess, collect stdout and stderr if it fails."
             traceln(`do: ${" ".join([for via (UTF8.decode) arg in (argv) arg])}`)
@@ -103,6 +121,3 @@ def makeBuda(findRule, => makeProcess, => stdio) as DeepFrozen:
             catch p:
                 traceln.exception(p)
                 p
-
-        match [=="ifChanged", args, _namedArgs]:
-            promiseAllFulfilled([for target in (args) buda(target)])
