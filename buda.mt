@@ -1,5 +1,5 @@
 import "lib/codec/utf8" =~ [=> UTF8]
-import "lib/streams" =~ [=> Sink]
+import "lib/streams" =~ [=> Sink, => makeSink, => flow]
 exports (makeBuda, rulesFromMap, which)
 def partialFlow(source, sink) :Vow[Void] as DeepFrozen:
     "Flow all packets from `source` to `sink`, like flow(), but don't tell the sink we're done."
@@ -62,12 +62,23 @@ def rulesFromMap(rulesMap :Map[Bytes, Any], defaults :Map[Bytes, Any]) as DeepFr
         else:
             return [rule, target]
 
-def makeBuda(findRule, => makeProcess, => stdio) as DeepFrozen:
+def makeBuda(findRule, => makeProcess, => makeFileResource, => stdio) as DeepFrozen:
+    def artifactMap := [].asMap().diverge()
     def stdout := stdio.stdout()
+    def storeResult(buildResult :Bytes) :Vow[Bytes]:
+        def [hash, sink] := makeSink.asBytes()
+        def proc := makeProcess(b`git`, [b`git`, b`hash-object`, b`-w`, b`--stdin`], [].asMap(), "stdout" => true, "stderr" => true, "stdin" => true)
+        traceln(`loading ${buildResult.size()} bytes`)
+        proc.stdin()(buildResult)
+        proc.stdin().complete()
+        partialFlow(proc.stderr(), stdout)
+        flow(proc.stdout(), sink)
+        return hash <- trim()
+
     return object buda:
         to main(target):
             return when (buda(target)) ->
-                traceln(`Done.`)
+                traceln(`Done.$\n${artifactMap}`)
                 0
             catch p:
                 traceln.exception(p)
@@ -78,27 +89,42 @@ def makeBuda(findRule, => makeProcess, => stdio) as DeepFrozen:
 
         to fulfillDependencies(rule, prefix):
             def deps :List[Bytes] := rule.getDependencies()
+            traceln(`rule $rule deps $deps`)
             def queue := deps.diverge()
             # process deps serially for now, in theory we could do this in parallel
             def fulfillDep():
                 def dep := queue.pop()
+                traceln(`dep $dep`)
                 def p := if (dep[0] == b`*`[0]) {
                     buda(prefix + dep.slice(1))
                 } else {
                     buda(dep)
                 }
                 return when (p) ->
-                    if (queue.size > 0):
+                    if (queue.size() > 0):
                         fulfillDep()
-
+            return fulfillDep()
         to run(target):
             escape e:
                 def [rule, prefix] := findRule(target, "FAIL" => e)
                 traceln(`target $target rule $rule prefix $prefix`)
                 return when (buda.fulfillDependencies(rule, prefix)) ->
-                    when (rule(buda, prefix, target + b`.buda.tmp`)) ->
+                    def tmpTarget := target + b`.buda.tmp`
+                    traceln(`starting $target`)
+                    when (rule(buda, prefix, tmpTarget)) ->
                         traceln(`finished $target`)
-                        buda.do(b`mv`, [b`mv`, target + b`.buda.tmp`, target])
+                        when (def f := makeFileResource(UTF8.decode(tmpTarget, null)).getContents()) ->
+                            when (def hash := storeResult(f)) ->
+                                artifactMap[target] := hash
+                                buda.do(b`mv`, [b`mv`, tmpTarget, target])
+                            catch p:
+                                traceln.exception(p)
+                                p
+                        catch q:
+                            traceln(`$rule did not write to $tmpTarget`)
+                            traceln.exception(q)
+                            q
+
             catch p:
                 # couldn't find a rule to rebuild a target, but maybe it exists?
                 return when (buda.do(b`test`, [b`test`, b`-e`, target])) ->
