@@ -64,6 +64,8 @@ def rulesFromMap(rulesMap :Map[Bytes, Any], defaults :Map[Bytes, Any]) as DeepFr
 
 def makeBuda(findRule, => makeProcess, => makeFileResource, => stdio) as DeepFrozen:
     def artifactMap := [].asMap().diverge()
+    def dependencyMap := [].asMap().diverge()
+    def depsCache := [].asMap().diverge()
     def stdout := stdio.stdout()
     def storeResult(buildResult :Bytes) :Vow[Bytes]:
         def [hash, sink] := makeSink.asBytes()
@@ -75,11 +77,42 @@ def makeBuda(findRule, => makeProcess, => makeFileResource, => stdio) as DeepFro
         flow(proc.stdout(), sink)
         return hash <- trim()
 
+    def writeArtifactMap(artifacts :Map[Bytes, Bytes]):
+        def [hash, sink] := makeSink.asBytes()
+        def proc := makeProcess(b`git`, [b`git`, b`mktree`, b`-z`], [].asMap(), "stdout" => true, "stderr" => true, "stdin" => true)
+        traceln(`writing artifact map`)
+        def stdin := proc.stdin()
+        for name => hash in (artifacts):
+            stdin(b`100644 blob `)
+            stdin(hash)
+            stdin(b`$\x09`)
+            for depName in (dependencyMap[name]):
+                stdin(artifacts[depName])
+                stdin(b`-`)
+            stdin(name)
+            stdin(b`$\x00`)
+        proc.stdin().complete()
+        partialFlow(proc.stderr(), stdout)
+        flow(proc.stdout(), sink)
+        return hash <- trim()
+
+    def storeArtifact(tmpTarget :Bytes, target :Bytes):
+        return when (def f := makeFileResource(UTF8.decode(tmpTarget, null)).getContents()) ->
+            when (def hash := storeResult(f)) ->
+                artifactMap[target] := hash
+        catch q:
+            traceln(`did not write to $target`)
+            traceln.exception(q)
+            q
+
     return object buda:
         to main(target):
-            return when (buda(target)) ->
-                traceln(`Done.$\n${artifactMap}`)
-                0
+
+            return when (buda <- maybeLoadCache() <- (target)) ->
+                when (def ahash := writeArtifactMap(artifactMap.snapshot())) ->
+                    when (buda.do(b`git`, [b`git`, b`update-ref`, b`refs/buda/latest`, ahash])) ->
+                        traceln(`Done.$\n${ahash}`)
+                        0
             catch p:
                 traceln.exception(p)
                 1
@@ -87,48 +120,74 @@ def makeBuda(findRule, => makeProcess, => makeFileResource, => stdio) as DeepFro
                 traceln.exception(ee)
                 1
 
-        to fulfillDependencies(rule, prefix):
+        to maybeLoadCache() :
+            def [treeDesc, sink] := makeSink.asBytes()
+            def proc := makeProcess(b`git`, [b`git`, b`ls-tree`, b`-z`, b`refs/buda/latest`], [].asMap(), "stdout" => true, "stderr" => true)
+            traceln(`loading artifact cache`)
+            return when (def ex := proc.wait()) ->
+                if (ex.exitStatus() == 0):
+                    flow(proc.stdout(), sink)
+                    # XXX state machine for parsing instead of waiting
+                    when (treeDesc) ->
+                        def lines := treeDesc.split(b`$\x00`)
+                        for line in (lines):
+                            if (line.size() == 0):
+                                continue
+                            def [data, filename] := line.split(b`$\t`, 1)
+                            def [_perms, _kind, hash] := data.split(b` `)
+                            def pieces := filename.split(b`-`).diverge()
+                            def name := pieces.pop()
+                            depsCache[name] := pieces.snapshot()
+                            artifactMap[name] := hash
+                        buda
+                else:
+                    flow(proc.stderr(), sink)
+                    when (treeDesc) -> { traceln(`Loading cache failed: ${treeDesc}`) }
+                    buda
+
+        to fulfillDependencies(target, rule, prefix):
             def deps :List[Bytes] := rule.getDependencies()
+            # Fetch old hashes, run all deps collecting new hashes, compare. If different, run build rule. Otherwise just keep old hash for this target
+            dependencyMap[target] := []
+            def dependencyOutputs := [].diverge()
             traceln(`rule $rule deps $deps`)
             def queue := deps.diverge()
             # process deps serially for now, in theory we could do this in parallel
             def fulfillDep():
                 def dep := queue.pop()
-                traceln(`dep $dep`)
-                def p := if (dep[0] == b`*`[0]) {
-                    buda(prefix + dep.slice(1))
+                def depName:= if (dep[0] == b`*`[0]) {
+                    prefix + dep.slice(1)
                 } else {
-                    buda(dep)
+                    dep
                 }
-                return when (p) ->
+                dependencyMap[target] with= (depName)
+                return when (def hash := buda(depName)) ->
+                    dependencyOutputs.push(hash)
                     if (queue.size() > 0):
                         fulfillDep()
-            return fulfillDep()
+            return when (fulfillDep()) ->
+                dependencyOutputs.snapshot() != depsCache[target]
         to run(target):
             escape e:
                 def [rule, prefix] := findRule(target, "FAIL" => e)
                 traceln(`target $target rule $rule prefix $prefix`)
-                return when (buda.fulfillDependencies(rule, prefix)) ->
-                    def tmpTarget := target + b`.buda.tmp`
-                    traceln(`starting $target`)
-                    when (rule(buda, prefix, tmpTarget)) ->
-                        traceln(`finished $target`)
-                        when (def f := makeFileResource(UTF8.decode(tmpTarget, null)).getContents()) ->
-                            when (def hash := storeResult(f)) ->
-                                artifactMap[target] := hash
+                return when (def dirty := buda.fulfillDependencies(target, rule, prefix)) ->
+                    if (dirty):
+                        def tmpTarget := target + b`.buda.tmp`
+                        traceln(`starting $target`)
+                        when (rule(buda, prefix, tmpTarget)) ->
+                            traceln(`finished $target`)
+                            when (def hash := storeArtifact(tmpTarget, target)) ->
                                 buda.do(b`mv`, [b`mv`, tmpTarget, target])
-                            catch p:
-                                traceln.exception(p)
-                                p
-                        catch q:
-                            traceln(`$rule did not write to $tmpTarget`)
-                            traceln.exception(q)
-                            q
-
+                                hash
+                    else:
+                        traceln(`$target is clean`)
+                        artifactMap[target]
             catch p:
-                # couldn't find a rule to rebuild a target, but maybe it exists?
+                # no rule means unconditionally store contents
                 return when (buda.do(b`test`, [b`test`, b`-e`, target])) ->
-                    null
+                    dependencyMap[target] := []
+                    storeArtifact(target, target)
                 catch _:
                     p
 
